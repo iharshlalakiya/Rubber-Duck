@@ -81,13 +81,28 @@ def get_open_flags_for_pr(repo: str, pr_number: int) -> list:
     return rows
 
 
+def get_all_open_flags_for_repo(repo: str) -> list:
+    """Used for the TECH_DEBT.md generator — every open flag across all PRs in this repo."""
+    return select_rows("flags", {"repo": repo, "status": "open"}, limit=500)
+
+
 def get_flag_by_comment_id(github_comment_id) -> dict | None:
     rows = select_rows("flags", {"github_comment_id": github_comment_id}, limit=1)
     return rows[0] if rows else None
 
 
+def get_flags_by_comment_id(github_comment_id) -> list:
+    """Returns ALL flags sharing a comment_id — used to detect batched (non-inline) comments."""
+    return select_rows("flags", {"github_comment_id": github_comment_id}, limit=50)
+
+
 def mark_flag_status(flag_id: str, status: str) -> bool:
     return update_row("flags", {"id": flag_id}, {"status": status})
+
+
+def mark_flags_resolved_for_pr(repo: str, pr_number: int):
+    """Called when a PR merges/closes — marks its still-open flags as resolved (assumed fixed)."""
+    update_row("flags", {"repo": repo, "pr_number": pr_number, "status": "open"}, {"status": "resolved"})
 
 
 def add_dismissed_pattern(repo: str, title_pattern: str):
@@ -97,6 +112,21 @@ def add_dismissed_pattern(repo: str, title_pattern: str):
 def get_dismissed_patterns(repo: str) -> list:
     rows = select_rows("dismissed_patterns", {"repo": repo}, limit=500)
     return [r["title_pattern"].lower() for r in rows]
+
+
+def get_old_open_flags_for_files(repo: str, files: list, exclude_pr_number: int) -> list:
+    """
+    Tech debt ledger lookup: finds OPEN flags from PREVIOUS PRs (not this one) that
+    touched any of the given files. Used to resurface unresolved issues when related
+    code changes again — the "post-merge drift" feature.
+    """
+    if not files:
+        return []
+    all_open = select_rows("flags", {"repo": repo, "status": "open"}, limit=500)
+    return [
+        f for f in all_open
+        if f.get("file") in files and f.get("pr_number") != exclude_pr_number
+    ]
 
 
 def is_configured() -> bool:

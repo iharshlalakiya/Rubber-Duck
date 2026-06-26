@@ -71,17 +71,30 @@ def get_changed_files(repo_full_name: str, pr_number: int) -> list:
     return [f["filename"] for f in resp.json()]
 
 
-def fetch_file_content(repo_full_name: str, path: str, ref: str = "main") -> str:
+def fetch_file_content(repo_full_name: str, path: str, ref: str = "main", _cache: dict = {}) -> str:
+    """
+    Cache keyed by (repo, path, ref) — within a single webhook handling, the same file
+    is sometimes requested more than once (e.g. context gathering + manifest parsing).
+    Note: this dict persists across requests too (cheap win, low memory cost for small repos);
+    fine for an MVP, but swap for a proper TTL cache if running long-lived against big repos.
+    """
+    cache_key = (repo_full_name, path, ref)
+    if cache_key in _cache:
+        return _cache[cache_key]
+
     url = f"https://api.github.com/repos/{repo_full_name}/contents/{path}"
     resp = requests.get(url, headers=gh_headers(), params={"ref": ref})
     if resp.status_code != 200:
+        _cache[cache_key] = ""
         return ""
     import base64
     content = resp.json().get("content", "")
     try:
-        return base64.b64decode(content).decode("utf-8", errors="ignore")
+        decoded = base64.b64decode(content).decode("utf-8", errors="ignore")
     except Exception:
-        return ""
+        decoded = ""
+    _cache[cache_key] = decoded
+    return decoded
 
 
 def post_pr_comment(repo_full_name: str, pr_number: int, body: str):
@@ -168,6 +181,7 @@ SKIP_PATH_PARTS = {
 
 MAX_TOTAL_CONTEXT_CHARS = 60000  # keep prompt size sane; ~15-20k tokens
 MAX_FILE_CHARS = 4000           # cap any single file so one huge file can't eat the budget
+MAX_FILES_TO_SCAN = 150         # hard cap on GitHub API calls per review — protects against huge repos
 
 
 def get_default_branch(repo_full_name: str) -> str:
@@ -211,14 +225,24 @@ def gather_repo_context(repo_full_name: str, changed_files: list):
     ref = get_default_branch(repo_full_name)
     all_paths = list_all_repo_files(repo_full_name, ref)
 
+    if len(all_paths) > MAX_FILES_TO_SCAN:
+        print(
+            f"[gather_repo_context] {repo_full_name} has {len(all_paths)} candidate files, "
+            f"capping at {MAX_FILES_TO_SCAN} to limit API calls/cost. "
+            f"Consider Tier 2 (embeddings/RAG) for repos this size."
+        )
+        all_paths = all_paths[:MAX_FILES_TO_SCAN]
+
     context_chunks = []
     total_chars = 0
+    files_fetched = 0
 
     for path in all_paths:
         if path in changed_files:
             continue  # already covered by the diff itself
 
         content = fetch_file_content(repo_full_name, path, ref)
+        files_fetched += 1
         if not content:
             continue
 
@@ -231,6 +255,7 @@ def gather_repo_context(repo_full_name: str, changed_files: list):
         context_chunks.append(chunk)
         total_chars += len(chunk)
 
+    print(f"[gather_repo_context] {repo_full_name}: fetched {files_fetched} files, {total_chars} context chars")
     return "\n".join(context_chunks), all_paths
 
 
@@ -456,6 +481,7 @@ Review the DIFF below using this checklist:
 RULES:
 - Only flag things you are genuinely confident about. Skip anything borderline or stylistic.
 - Severity: "high" (security/correctness risk) or "medium" (clarity/maintainability risk).
+- confidence: a number 0.0-1.0 for how sure you are this is a real, valid issue (not a guess).
 - Max 5 flags. If there's nothing worth flagging, return an empty list — do not invent filler comments.
 - Respond ONLY with valid JSON, no markdown fences, no preamble. Format:
 
@@ -465,9 +491,14 @@ RULES:
       "severity": "high",
       "title": "short title",
       "detail": "1-2 sentence explanation, reference the specific file/line if possible",
-      "file": "filename"
+      "file": "filename",
+      "confidence": 0.85
     }}
-  ]
+  ],
+  "future_hire_score": {{
+    "score": 7,
+    "reason": "1 sentence on why this diff would or wouldn't confuse a new hire in 6 months"
+  }}
 }}
 
 REPO CONTEXT (existing related files, for cross-file comparison):
@@ -476,6 +507,18 @@ REPO CONTEXT (existing related files, for cross-file comparison):
 PR DIFF:
 {diff}
 """
+
+
+# Minimum confidence (0.0-1.0) a flag needs to actually get posted — cuts noise from guesses.
+MIN_CONFIDENCE_THRESHOLD = 0.6
+
+
+def filter_low_confidence_flags(flags: list, threshold: float = MIN_CONFIDENCE_THRESHOLD) -> list:
+    """
+    Drops flags below the confidence threshold. Defaults missing confidence to 1.0
+    (assume confident) so this stays backward-compatible if a model ever omits the field.
+    """
+    return [f for f in flags if f.get("confidence", 1.0) >= threshold]
 
 
 def review_with_llm(diff: str, context: str, detected_stacks: set, stack_label: str) -> dict:
@@ -515,9 +558,13 @@ def review_with_llm(diff: str, context: str, detected_stacks: set, stack_label: 
 
 
 # ---------- Digest formatting ----------
-def format_digest(flags: list) -> str:
+def format_digest(flags: list, future_hire_score: dict | None = None) -> str:
+    score_line = ""
+    if future_hire_score and future_hire_score.get("score") is not None:
+        score_line = f"\n📋 **Future-hire readiness: {future_hire_score['score']}/10** — {future_hire_score.get('reason', '')}\n"
+
     if not flags:
-        return "**🦆 Rubber Duck** — No flags this time. Looks good."
+        return f"**🦆 Rubber Duck** — No flags this time. Looks good.{score_line}"
 
     high = [f for f in flags if f.get("severity") == "high"]
     medium = [f for f in flags if f.get("severity") == "medium"]
@@ -526,6 +573,9 @@ def format_digest(flags: list) -> str:
     icon = {"high": "🔴", "medium": "🟡"}
     for f in flags:
         lines.append(f"{icon.get(f.get('severity'), '⚪')} **{f.get('title')}** — {f.get('detail')} (`{f.get('file', '')}`)")
+
+    if score_line:
+        lines.append(score_line)
 
     lines.append("")
     lines.append("_Reply directly under any flag's comment to dismiss it, or comment `@RubberDuck <question>` anywhere on this PR._")
@@ -549,11 +599,116 @@ def filter_dismissed_flags(repo_full_name: str, flags: list) -> list:
     return kept
 
 
+def get_file_sha_if_exists(repo_full_name: str, path: str, ref: str) -> str | None:
+    """Returns the blob SHA of a file if it exists (required by GitHub's update API), else None."""
+    url = f"https://api.github.com/repos/{repo_full_name}/contents/{path}"
+    resp = requests.get(url, headers=gh_headers(), params={"ref": ref})
+    if resp.status_code == 200:
+        return resp.json().get("sha")
+    return None
+
+
+def commit_file_to_repo(repo_full_name: str, path: str, content: str, ref: str, commit_message: str):
+    """Creates or updates a file directly on the given branch via GitHub's Contents API."""
+    import base64
+    url = f"https://api.github.com/repos/{repo_full_name}/contents/{path}"
+    existing_sha = get_file_sha_if_exists(repo_full_name, path, ref)
+
+    payload = {
+        "message": commit_message,
+        "content": base64.b64encode(content.encode("utf-8")).decode("utf-8"),
+        "branch": ref,
+    }
+    if existing_sha:
+        payload["sha"] = existing_sha
+
+    resp = requests.put(url, headers=gh_headers(), json=payload)
+    if resp.status_code not in (200, 201):
+        print(f"[github] commit_file_to_repo failed for {path} -> {resp.status_code} {resp.text}")
+        return None
+    return resp.json()
+def generate_tech_debt_markdown(open_flags: list) -> str:
+    """Builds the full TECH_DEBT.md content from current open flags, grouped by severity."""
+    if not open_flags:
+        return (
+            "# Tech Debt Ledger\n\n"
+            "_Auto-generated by Rubber Duck. No open flags right now — nice._\n"
+        )
+
+    high = [f for f in open_flags if f.get("severity") == "high"]
+    medium = [f for f in open_flags if f.get("severity") != "high"]
+
+    lines = [
+        "# Tech Debt Ledger",
+        "",
+        "_Auto-generated by Rubber Duck after each PR review. Reflects currently unresolved flags._",
+        "",
+        f"**{len(open_flags)} open flag(s)** — {len(high)} high, {len(medium)} medium/other",
+        "",
+    ]
+
+    if high:
+        lines.append("## 🔴 High severity")
+        lines.append("")
+        for f in high:
+            lines.append(f"- **{f.get('title')}** — `{f.get('file')}` (from PR #{f.get('pr_number')})")
+            lines.append(f"  {f.get('detail')}")
+        lines.append("")
+
+    if medium:
+        lines.append("## 🟡 Medium / other")
+        lines.append("")
+        for f in medium:
+            lines.append(f"- **{f.get('title')}** — `{f.get('file')}` (from PR #{f.get('pr_number')})")
+            lines.append(f"  {f.get('detail')}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def update_tech_debt_file(repo_full_name: str, ref: str):
+    """Regenerates and commits TECH_DEBT.md directly to the repo's default branch."""
+    if not supabase_store.is_configured():
+        return
+    open_flags = supabase_store.get_all_open_flags_for_repo(repo_full_name)
+    content = generate_tech_debt_markdown(open_flags)
+    commit_file_to_repo(
+        repo_full_name, "TECH_DEBT.md", content, ref,
+        commit_message="🦆 Rubber Duck: update tech debt ledger",
+    )
+
+
+def post_old_ledger_reminders(repo_full_name: str, pr_number: int, changed_files: list):
+    """
+    Tech debt ledger / post-merge drift: if any of the files in THIS PR have old
+    unresolved flags from PREVIOUS PRs, resurface them as a reminder comment.
+    This is the differentiator vs. stateless review bots that only look at one PR at a time.
+    """
+    if not supabase_store.is_configured():
+        return
+    old_flags = supabase_store.get_old_open_flags_for_files(repo_full_name, changed_files, exclude_pr_number=pr_number)
+    if not old_flags:
+        return
+
+    lines = ["**🦆 Rubber Duck — ↩️ Resurfaced from earlier PRs**", ""]
+    for f in old_flags[:5]:
+        lines.append(f"- **{f.get('title')}** in `{f.get('file')}` (flagged in PR #{f.get('pr_number')}, still unresolved)")
+    lines.append("")
+    lines.append("_These were flagged before and the related code changed again. Worth a look, or reply `not relevant` to dismiss._")
+
+    post_pr_comment(repo_full_name, pr_number, "\n".join(lines))
+
+
 def post_flags_to_pr(repo_full_name: str, pr_number: int, diff: str, flags: list):
     """
-    Posts each flag as its OWN comment — inline (anchored to a diff line) when possible,
-    falling back to a regular issue comment when the flag's file/line isn't part of the diff.
-    Each posted comment is saved to Supabase so replies can be matched back to the right flag.
+    Severity-aware posting to cut noise:
+    - HIGH severity flags each get their OWN inline comment (anchored to a diff line when
+      possible) — these are important enough to be impossible to miss, and individual
+      comments support reply-threading for precise dismiss/discuss.
+    - MEDIUM/lower severity flags get batched into ONE combined comment instead of N separate
+      ones — still useful, but doesn't spam the PR with a comment per minor nit.
+    Each flag (whether posted individually or as part of a batch) is still saved to Supabase
+    individually, so the ledger and dismiss-tracking work the same either way.
     """
     if not flags:
         post_pr_comment(repo_full_name, pr_number, format_digest([]))
@@ -563,13 +718,15 @@ def post_flags_to_pr(repo_full_name: str, pr_number: int, diff: str, flags: list
     commit_sha = get_pr_head_sha(repo_full_name, pr_number)
     icon = {"high": "🔴", "medium": "🟡"}
 
-    intro_posted = False
+    high_flags = [f for f in flags if f.get("severity") == "high"]
+    other_flags = [f for f in flags if f.get("severity") != "high"]
 
-    for f in flags:
+    # --- HIGH severity: individual inline comments ---
+    for f in high_flags:
         file = f.get("file", "")
         title = f.get("title", "Flag")
         detail = f.get("detail", "")
-        severity = f.get("severity", "medium")
+        severity = f.get("severity", "high")
         body = (
             f"{icon.get(severity, '⚪')} **🦆 Rubber Duck — {title}**\n\n{detail}\n\n"
             f"_Reply here to discuss or dismiss this flag._"
@@ -584,24 +741,39 @@ def post_flags_to_pr(repo_full_name: str, pr_number: int, diff: str, flags: list
         if anchored_line:
             comment = post_inline_review_comment(repo_full_name, pr_number, commit_sha, file, anchored_line, body)
             comment_type = "review"
-
         if not comment:
-            # fallback: couldn't anchor to a diff line, post as a plain PR comment instead
             comment = post_pr_comment(repo_full_name, pr_number, body)
             comment_type = "issue"
 
         if supabase_store.is_configured() and comment:
-            comment_id = comment.get("id")
             supabase_store.save_flag(
-                repo=repo_full_name, pr_number=pr_number, github_comment_id=comment_id,
+                repo=repo_full_name, pr_number=pr_number, github_comment_id=comment.get("id"),
                 comment_type=comment_type, file=file, line=anchored_line,
                 severity=severity, title=title, detail=detail,
             )
 
-        intro_posted = True
+    # --- MEDIUM/other severity: one batched comment ---
+    if other_flags:
+        lines = [f"**🦆 Rubber Duck — {len(other_flags)} additional flag(s) (lower severity, batched)**", ""]
+        for f in other_flags:
+            sev = f.get("severity", "medium")
+            lines.append(f"{icon.get(sev, '⚪')} **{f.get('title')}** — {f.get('detail')} (`{f.get('file', '')}`)")
+        lines.append("")
+        lines.append("_Reply `@RubberDuck <which flag> not relevant` to dismiss one of these — batched flags don't support direct reply-threading._")
+        batch_body = "\n".join(lines)
 
-    if not intro_posted:
-        post_pr_comment(repo_full_name, pr_number, format_digest(flags))
+        batch_comment = post_pr_comment(repo_full_name, pr_number, batch_body)
+
+        if supabase_store.is_configured() and batch_comment:
+            for f in other_flags:
+                # Batched flags share the same github_comment_id (the batch comment) —
+                # dismiss-by-reply-threading won't resolve to one specific flag here,
+                # but @RubberDuck mentions can still reference them by title.
+                supabase_store.save_flag(
+                    repo=repo_full_name, pr_number=pr_number, github_comment_id=batch_comment.get("id"),
+                    comment_type="issue_batched", file=f.get("file", ""), line=None,
+                    severity=f.get("severity", "medium"), title=f.get("title", "Flag"), detail=f.get("detail", ""),
+                )
 
 
 # ---------- LLM helpers for interaction (reply intent + conversational answers) ----------
@@ -610,8 +782,45 @@ DISMISS_KEYWORDS = ("not relevant", "ignore", "dismiss", "wontfix", "won't fix",
 
 
 def reply_is_dismissal(reply_text: str) -> bool:
+    """
+    Fast-path: obvious keyword matches skip the LLM call entirely (cheaper, instant).
+    Falls back to an LLM intent check for everything else, since real replies are
+    often phrased creatively ("nah skip that", "this is fine as-is", "not a real issue").
+    """
     lowered = reply_text.lower()
-    return any(k in lowered for k in DISMISS_KEYWORDS)
+    if any(k in lowered for k in DISMISS_KEYWORDS):
+        return True
+    return llm_classify_dismissal(reply_text)
+
+
+def llm_classify_dismissal(reply_text: str) -> bool:
+    prompt = f"""A developer replied to a code review flag with this message:
+"{reply_text}"
+
+Is this message DISMISSING the flag (saying it's not relevant, intentional, a false positive,
+or otherwise telling the reviewer to drop it) — as opposed to asking a question, agreeing to fix it,
+or saying something unrelated?
+
+Respond with exactly one word: YES or NO."""
+
+    try:
+        resp = requests.post(
+            HF_API_URL,
+            headers={"Authorization": f"Bearer {HF_API_TOKEN}", "Content-Type": "application/json"},
+            json={
+                "model": HF_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 5,
+                "temperature": 0.0,
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        answer = resp.json()["choices"][0]["message"]["content"].strip().upper()
+        return answer.startswith("YES")
+    except Exception as e:
+        print(f"[llm_classify_dismissal] failed, defaulting to NO: {e}")
+        return False
 
 
 def answer_mention_with_llm(question: str, open_flags: list) -> str:
@@ -650,11 +859,20 @@ Respond with plain text only, no JSON, no markdown headers."""
 
 def handle_pull_request_event(payload: dict) -> dict:
     action = payload.get("action")
-    if action not in ("opened", "synchronize", "reopened"):
-        return {"status": "ignored", "reason": f"action {action} not handled"}
 
     repo_full_name = payload["repository"]["full_name"]
     pr_number = payload["pull_request"]["number"]
+
+    if action == "closed":
+        # If merged, assume flags were addressed via review; mark resolved so the
+        # ledger doesn't resurface stale items forever. (Doesn't verify the fix —
+        # just stops nagging once the PR is gone.)
+        if payload["pull_request"].get("merged") and supabase_store.is_configured():
+            supabase_store.mark_flags_resolved_for_pr(repo_full_name, pr_number)
+        return {"status": "ok", "action": "closed_handled"}
+
+    if action not in ("opened", "synchronize", "reopened"):
+        return {"status": "ignored", "reason": f"action {action} not handled"}
 
     diff = get_pr_diff(repo_full_name, pr_number)
     changed_files = get_changed_files(repo_full_name, pr_number)
@@ -667,13 +885,30 @@ def handle_pull_request_event(payload: dict) -> dict:
 
     review = review_with_llm(diff, context, detected_stacks, stack_label)
     flags = review.get("flags", [])
+
+    flags_before_confidence = len(flags)
+    flags = filter_low_confidence_flags(flags)
     flags = filter_dismissed_flags(repo_full_name, flags)
 
+    # Tech debt ledger: resurface old unresolved flags on files touched by this PR.
+    post_old_ledger_reminders(repo_full_name, pr_number, changed_files)
+
     post_flags_to_pr(repo_full_name, pr_number, diff, flags)
+
+    future_hire_score = review.get("future_hire_score")
+    if future_hire_score:
+        post_pr_comment(
+            repo_full_name, pr_number,
+            f"📋 **Future-hire readiness: {future_hire_score.get('score', '?')}/10** — {future_hire_score.get('reason', '')}",
+        )
+
+    # Keep TECH_DEBT.md in sync with the latest ledger state, visible directly in the repo.
+    update_tech_debt_file(repo_full_name, ref)
 
     return {
         "status": "ok",
         "flags_found": len(flags),
+        "flags_dropped_low_confidence": flags_before_confidence - len(flags),
         "detected_stacks": sorted(detected_stacks),
         "is_monorepo": is_monorepo(all_paths),
         "groups": {k: {"stacks": sorted(v["stacks"]), "files": v["changed_files"]} for k, v in groups.items()},
@@ -694,14 +929,23 @@ def handle_review_comment_reply(payload: dict) -> dict:
     if not supabase_store.is_configured():
         return {"status": "ignored", "reason": "supabase not configured"}
 
-    flag = supabase_store.get_flag_by_comment_id(in_reply_to_id)
-    if not flag:
+    matching_flags = supabase_store.get_flags_by_comment_id(in_reply_to_id)
+    if not matching_flags:
         return {"status": "ignored", "reason": "reply not tied to a known flag"}
 
     repo_full_name = payload["repository"]["full_name"]
     pr_number = payload["pull_request"]["number"]
     reply_text = comment.get("body", "")
-    reply_comment_id = comment.get("id")
+
+    if len(matching_flags) > 1:
+        # This is a reply on a BATCHED comment (multiple flags share this comment_id) —
+        # we can't know which specific flag they mean without asking, so answer
+        # conversationally using all of them as context instead of guessing one to dismiss.
+        answer = answer_mention_with_llm(reply_text, matching_flags)
+        reply_to_review_comment(repo_full_name, pr_number, in_reply_to_id, f"🦆 {answer}")
+        return {"status": "ok", "action": "answered_batched", "flag_count": len(matching_flags)}
+
+    flag = matching_flags[0]
 
     if reply_is_dismissal(reply_text):
         supabase_store.mark_flag_status(flag["id"], "dismissed")
